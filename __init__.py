@@ -2,9 +2,8 @@
 
 import nodes
 import folder_paths
-
-import bitsandbytes
-
+import contextlib
+from . import stream
 import torch
 import bitsandbytes as bnb
 
@@ -136,9 +135,110 @@ class ForgeLoader4Bit(torch.nn.Module):
         else:
             super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
+
+stash = {}
+
+def get_weight_and_bias(layer, weight_args=None, bias_args=None, weight_fn=None, bias_fn=None):
+    patches = getattr(layer, 'forge_online_loras', None)
+    weight_patches, bias_patches = None, None
+
+    if patches is not None:
+        weight_patches = patches.get('weight', None)
+
+    if patches is not None:
+        bias_patches = patches.get('bias', None)
+
+    weight = None
+    if layer.weight is not None:
+        weight = layer.weight
+        if weight_fn is not None:
+            if weight_args is not None:
+                fn_device = weight_args.get('device', None)
+                if fn_device is not None:
+                    weight = weight.to(device=fn_device)
+            weight = weight_fn(weight)
+        if weight_args is not None:
+            weight = weight.to(**weight_args)
+        if weight_patches is not None:
+            weight = merge_lora_to_weight(patches=weight_patches, weight=weight, key="online weight lora", computation_dtype=weight.dtype)
+
+    bias = None
+    if layer.bias is not None:
+        bias = layer.bias
+        if bias_fn is not None:
+            if bias_args is not None:
+                fn_device = bias_args.get('device', None)
+                if fn_device is not None:
+                    bias = bias.to(device=fn_device)
+            bias = bias_fn(bias)
+        if bias_args is not None:
+            bias = bias.to(**bias_args)
+        if bias_patches is not None:
+            bias = merge_lora_to_weight(patches=bias_patches, weight=bias, key="online bias lora", computation_dtype=bias.dtype)
+    return weight, bias
+
+def weights_manual_cast(layer, x, skip_weight_dtype=False, skip_bias_dtype=False, weight_fn=None, bias_fn=None):
+    weight, bias, signal = None, None, None
+    non_blocking = True
+
+    if getattr(x.device, 'type', None) == 'mps':
+        non_blocking = False
+
+    target_dtype = x.dtype
+    target_device = x.device
+
+    if skip_weight_dtype:
+        weight_args = dict(device=target_device, non_blocking=non_blocking)
+    else:
+        weight_args = dict(device=target_device, dtype=target_dtype, non_blocking=non_blocking)
+
+    if skip_bias_dtype:
+        bias_args = dict(device=target_device, non_blocking=non_blocking)
+    else:
+        bias_args = dict(device=target_device, dtype=target_dtype, non_blocking=non_blocking)
+
+    if stream.should_use_stream():
+        with stream.stream_context()(stream.mover_stream):
+            weight, bias = get_weight_and_bias(layer, weight_args, bias_args, weight_fn=weight_fn, bias_fn=bias_fn)
+            signal = stream.mover_stream.record_event()
+    else:
+        weight, bias = get_weight_and_bias(layer, weight_args, bias_args, weight_fn=weight_fn, bias_fn=bias_fn)
+
+    return weight, bias, signal
+
+@contextlib.contextmanager
+def main_stream_worker(weight, bias, signal):
+    if signal is None or not stream.should_use_stream():
+        yield
+        return
+
+    with stream.stream_context()(stream.current_stream):
+        stream.current_stream.wait_event(signal)
+        yield
+        finished_signal = stream.current_stream.record_event()
+        stash[id(finished_signal)] = (weight, bias, finished_signal)
+
+    garbage = []
+    for k, (w, b, s) in stash.items():
+        if s.query():
+            garbage.append(k)
+
+    for k in garbage:
+        del stash[k]
+    return
+
+def cleanup_cache():
+    if not stream.should_use_stream():
+        return
+
+    stream.current_stream.synchronize()
+    stream.mover_stream.synchronize()
+    stash.clear()
+    return
+
 current_device = None
 current_dtype = None
-current_manual_cast_enabled = False
+current_manual_cast_enabled = True
 current_bnb_dtype = None
 
 import comfy.ops
