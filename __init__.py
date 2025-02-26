@@ -157,6 +157,10 @@ class OPS(comfy.ops.manual_cast):
                 # And it only invokes one time, and most linear does not have bias
                 self.bias.data = self.bias.data.to(x.dtype)
 
+            if x.device.type != 'cpu':
+                self.weight = self.weight.to(x.device.type)
+                self.bias = torch.nn.Parameter(self.bias.to(x.device.type))
+
             if not self.parameters_manual_cast:
                 return functional_linear_4bits(x, self.weight, self.bias)
             elif not self.weight.bnb_quantized:
