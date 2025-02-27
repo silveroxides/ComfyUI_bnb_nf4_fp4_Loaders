@@ -1,3 +1,5 @@
+#shamelessly taken from forge
+
 import torch
 
 def stream_context():

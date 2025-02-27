@@ -1,27 +1,27 @@
-#### ~~NOTE: This is very likely Deprecated in favor of GGUF which seems to give better results~~ 
-Some users can experience speedup by combining loading UNET as NF4 using the loader from this repo and load T5XXL as GGUF using the repo from https://github.com/city96/ComfyUI-GGUF
 
-Now on the [manager](https://github.com/ltdrdata/ComfyUI-Manager) for easy installation. Make sure to select Channel:dev in the ComfyUI manager menu or install via git url.
+## NF4 model loader of ComfyUI
 
-You can find the checkpoints and UNET in the linked repositories on huggingface or by searching for NF4 on Civitai
+Both Checkpoint and UNET loader are included.<br/>
+Same as https://github.com/silveroxides/ComfyUI_bnb_nf4_fp4_Loaders, but fixed a RuntimeError.<br/>
+```RuntimeError: All input tensors need to be on the same GPU, but found some tensors to not be on a GPU.```<br/>
+Recommend FluxFusion to accelerate generating: https://huggingface.co/Anibaaal/Flux-Fusion-DS-merge-gguf-nf4-fp4-fp8-fp16<br/>
+Recommend GGUF to generate more precisely (but more slowly than sft): https://github.com/city96/ComfyUI-GGUF<br/>
 
-### [CivitAI search link](https://civitai.com/search/models?baseModel=Flux.1%20S&baseModel=Flux.1%20D&sortBy=models_v9&query=nf4)
 
-### [nf4 flux unet only](https://huggingface.co/silveroxides/flux1-nf4-unet)
+## Usage
+1. Run `pip install bitsandbytes` when newly installed.
+2. Make sure your ComfyUI is updated, launching ComfyUI.
+3. Replace vanilla model loader node with the new node:
+    * "CheckpointLoaderNF4": Load NF4 fusion model placed at `checkpoints` folder
+    * "UNETLoaderNF4": Load NF4 unet model placed at `unet` folder, this also requires additional CLIP and VAE loaded.
+        * VAE: downloaded into `vae` folder, loaded with vanilla VAE loader.
+            * https://huggingface.co/StableDiffusionVN/Flux/blob/main/Vae/flux_vae.safetensors
+        * CLIP: download into `clip` or `text_encoders` folder, loaded with vanilla DualCLIP loader.
+            * t5xxl: https://huggingface.co/silveroxides/CLIP-Collection/blob/main/t5xxl_flan_latest-fp8_e4m3fn.safetensors
+            * clip_l: https://huggingface.co/zer0int/CLIP-SAE-ViT-L-14/blob/main/ViT-L-14-GmP-SAE-TE-only.safetensors
 
-### [nf4 flux dev checkpoint](https://huggingface.co/lllyasviel/flux1-dev-bnb-nf4/blob/main/flux1-dev-bnb-nf4.safetensors)
-
-### [nf4 flux schnell checkpoint](https://huggingface.co/silveroxides/flux1-nf4-weights/blob/main/flux1-schnell-bnb-nf4.safetensors)
-
-Requires installing bitsandbytes.
-
-Make sure your ComfyUI is updated.
-
-The nodes are: 
-#### "CheckpointLoaderNF4": "Load NF4 Flux Checkpoint"
-
-#### "UNETLoaderNF4": "Load NF4 Flux UNET"
-
-just plug it in your flux workflow instead of the regular ones.
-
+## Credits
 Code adapted from the implementation by Illyasviel at [Forge](https://github.com/lllyasviel/stable-diffusion-webui-forge).
+
+## Known Issues
+You may get OOM on first task if your RAM / VRAM is lower than 16GB / 8GB.
