@@ -1,18 +1,30 @@
 #shamelessly taken from forge
 
 import folder_paths
-
+import logging
 import torch
 import bitsandbytes as bnb
 
 from bitsandbytes.nn.modules import Params4bit, QuantState
+from nodes import CLIPLoader, DualCLIPLoader
 
+# sync from comfy.model_detection.detect_unet_config
+_IN_CHANNELS_KEYS = [
+    'x_embedder.proj',
+    'img_in.proj',
+    'img_in',
+    'x_embedder.proj.1',
+    'patch_embed.proj',
+    'latent_in',
+    'x_embedder',
+    'input_proj',
+    'input_blocks.0.0',
+]
 
 def functional_linear_4bits(x, weight, bias):
     out = bnb.matmul_4bit(x, weight.t(), bias=bias, quant_state=weight.quant_state)
     out = out.to(x)
     return out
-
 
 def copy_quant_state(state: QuantState, device: torch.device = None) -> QuantState:
     if state is None:
@@ -92,7 +104,6 @@ class ForgeParams4bit(Params4bit):
             self.quant_state = n.quant_state
             return n
 
-
 class ForgeLoader4Bit(torch.nn.Module):
     def __init__(self, *, device, dtype, quant_type, **kwargs):
         super().__init__()
@@ -148,8 +159,30 @@ class ForgeLoader4Bit(torch.nn.Module):
         else:
             super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
-
 import comfy.ops
+import comfy.model_detection
+
+def _in_channels_patch(unet_config, state_dict=None, unet_key_prefix=""):
+    if state_dict and unet_config.get('in_channels') == 1:
+        is_nf4 = False
+        for k in _IN_CHANNELS_KEYS:
+            bnb_key = '{}{}.weight.quant_state.bitsandbytes__nf4'.format(unet_key_prefix, k)
+            if bnb_key in state_dict:
+                is_nf4 = True
+                break
+        if is_nf4:
+            size = state_dict['{}{}.weight'.format(unet_key_prefix, k)].shape[0]
+            bias = state_dict['{}{}.bias'.format(unet_key_prefix, k)].shape[0]
+            unet_config['in_channels'] = 2 * size // bias
+
+    for model_config in comfy.supported_models.models:
+        if model_config.matches(unet_config, state_dict, unet_key_prefix=unet_key_prefix):
+            return model_config(unet_config)
+
+    logging.error("no match {}".format(unet_config))
+    return None
+
+comfy.model_detection.model_config_from_unet_config = _in_channels_patch
 
 def make_ops(loader_class, current_device = None, current_dtype = None, current_manual_cast_enabled = False, current_bnb_dtype = None):
 
@@ -184,18 +217,18 @@ def make_ops(loader_class, current_device = None, current_dtype = None, current_
 
 class CheckpointLoaderNF4:
     NodeId = 'CheckpointLoaderNF4'
-    NodeName = 'Load FP4 or NF4 Quantized Checkpoint Model'
+    NodeName = 'NF4/FP4 Checkpoint Loader'
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
             "ckpt_name": (folder_paths.get_filename_list("checkpoints"), ),
-            "bnb_dtype": (("default", "nf4", "fp4"), {"default": "default"}),
+            "bnb_dtype": (("default", "nf4", "fp4"), {"advanced": True}),
          }}
 
     RETURN_TYPES = ("MODEL", "CLIP", "VAE")
     FUNCTION = "load_checkpoint"
 
-    CATEGORY = "loaders"
+    CATEGORY = "model/loaders"
 
     def load_checkpoint(self, ckpt_name, bnb_dtype="default"):
         if bnb_dtype == "default":
@@ -207,17 +240,17 @@ class CheckpointLoaderNF4:
 
 class UNETLoaderNF4:
     NodeId = 'UNETLoaderNF4'
-    NodeName = 'Load FP4 or NF4 Quantized Diffusion or UNET Model'
+    NodeName = 'NF4/FP4 UNET Loader'
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
             "unet_name": (folder_paths.get_filename_list("diffusion_models"), ),
-            "bnb_dtype": (("default", "nf4", "fp4"), {"default": "default"}),
+            "bnb_dtype": (("default", "nf4", "fp4"), {"advanced": True}),
          }}
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "load_unet"
 
-    CATEGORY = "advanced/loaders"
+    CATEGORY = "model/loaders"
 
     def load_unet(self, unet_name, bnb_dtype="default"):
         if bnb_dtype == "default":
@@ -230,73 +263,53 @@ class UNETLoaderNF4:
 class CLIPLoaderNF4:
     # WIP
     NodeId = 'CLIPLoaderNF4'
-    NodeName = 'Load FP4 or NF4 Quantized Text Encoder'
+    NodeName = 'NF4/FP4 CLIP Loader'
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {
-            "clip_name": (folder_paths.get_filename_list("text_encoders"), ),
-            "type": (["stable_diffusion", "stable_cascade", "sd3", "stable_audio", "mochi", "ltxv", "pixart", "cosmos"], ),
-            "bnb_dtype": (("default", "nf4", "fp4"), {"default": "default"}),
-         }}
+        base = CLIPLoader.INPUT_TYPES()
+        base['optional']['bnb_dtype'] = (("default", "nf4", "fp4"), {"advanced": True})
+        return base
     RETURN_TYPES = ("CLIP",)
     FUNCTION = "load_clip"
 
-    CATEGORY = "advanced/loaders"
+    CATEGORY = "model/loaders"
 
-    def load_clip(self, clip_name, type):
-        if type == "stable_cascade":
-            clip_type = comfy.sd.CLIPType.STABLE_CASCADE
-        elif type == "sd3":
-            clip_type = comfy.sd.CLIPType.SD3
-        elif type == "stable_audio":
-            clip_type = comfy.sd.CLIPType.STABLE_AUDIO
-        elif type == "mochi":
-            clip_type = comfy.sd.CLIPType.MOCHI
-        elif type == "ltxv":
-            clip_type = comfy.sd.CLIPType.LTXV
-        elif type == "pixart":
-            clip_type = comfy.sd.CLIPType.PIXART
-        else:
-            clip_type = comfy.sd.CLIPType.STABLE_DIFFUSION
+    def load_clip(self, clip_name, type, device="default"):
+        clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
 
-        clip_path = folder_paths.get_full_path("clip", clip_name)
-        clip = comfy.sd.load_clip(ckpt_paths=[clip_path], embedding_directory=folder_paths.get_folder_paths("embeddings"), clip_type=clip_type, model_options={"custom_operations": OPS})
+        model_options = {"custom_operations": OPS}
+        if device == "cpu":
+            model_options["load_device"] = model_options["offload_device"] = torch.device("cpu")
+
+        clip_path = folder_paths.get_full_path_or_raise("text_encoders", clip_name)
+        clip = comfy.sd.load_clip(ckpt_paths=[clip_path], embedding_directory=folder_paths.get_folder_paths("embeddings"), clip_type=clip_type, model_options=model_options)
         return (clip,)
 
 class DualCLIPLoaderNF4:
     # WIP
     NodeId = 'DualCLIPLoaderNF4'
-    NodeName = 'Load FP4 or NF4 Quantized Text Encoders'
+    NodeName = 'NF4/FP4 Dual CLIP Loader'
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {
-            "clip_name1": (folder_paths.get_filename_list("text_encoders"), ),
-            "clip_name2": (folder_paths.get_filename_list("text_encoders"), ),
-            "type": (["sdxl", "sd3", "flux", "hunyuan_video", "custom_flux", "fluxmod"], ),
-            "bnb_dtype": (("default", "nf4", "fp4"), {"default": "default"}),
-         }}
+        base = DualCLIPLoader.INPUT_TYPES()
+        base['optional']['bnb_dtype'] = (("default", "nf4", "fp4"), {"advanced": True})
+        return base
     RETURN_TYPES = ("CLIP",)
     FUNCTION = "load_clip"
 
-    CATEGORY = "advanced/loaders"
+    CATEGORY = "model/loaders"
 
-    def load_clip(self, clip_name1, clip_name2, type):
+    def load_clip(self, clip_name1, clip_name2, type, device="default"):
+        clip_type = getattr(comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
+
         clip_path1 = folder_paths.get_full_path_or_raise("text_encoders", clip_name1)
         clip_path2 = folder_paths.get_full_path_or_raise("text_encoders", clip_name2)
-        if type == "sdxl":
-            clip_type = comfy.sd.CLIPType.STABLE_DIFFUSION
-        elif type == "sd3":
-            clip_type = comfy.sd.CLIPType.SD3
-        elif type == "flux":
-            clip_type = comfy.sd.CLIPType.FLUX
-        elif type == "hunyuan_video":
-            clip_type = comfy.sd.CLIPType.HUNYUAN_VIDEO
-        elif type == "custom_flux":
-            clip_type = comfy.sd.CLIPType.FLUXC
-        elif type == "fluxmod":
-            clip_type = comfy.sd.CLIPType.FLUXMOD
 
-        clip = comfy.sd.load_clip(ckpt_paths=[clip_path1, clip_path2], embedding_directory=folder_paths.get_folder_paths("embeddings"), clip_type=clip_type, model_options={"custom_operations": OPS})
+        model_options = {"custom_operations": OPS}
+        if device == "cpu":
+            model_options["load_device"] = model_options["offload_device"] = torch.device("cpu")
+
+        clip = comfy.sd.load_clip(ckpt_paths=[clip_path1, clip_path2], embedding_directory=folder_paths.get_folder_paths("embeddings"), clip_type=clip_type, model_options=model_options)
         return (clip,)
 
 node_list = [
@@ -305,8 +318,8 @@ node_list = [
     # Diffusion model loaders
     UNETLoaderNF4,
     # Text encoder model loaders
-    # WIP CLIPLoaderNF4,
-    # WIP DualCLIPLoaderNF4,
+    CLIPLoaderNF4,
+    DualCLIPLoaderNF4,
 ]
 
 NODE_CLASS_MAPPINGS = {}
